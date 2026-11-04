@@ -1,3 +1,16 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+data/
+*.zip
+
+# 内部部署记录（含服务器信息，不公开）
 DEPLOYMENT.md

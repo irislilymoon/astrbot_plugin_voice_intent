@@ -1,11 +1,26 @@
 # 语音意图回复
 
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.24.2-blue)](https://astrbot.app)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 AstrBot 自带的语音回复是「按概率掷骰子」：`provider_tts_settings.trigger_probability` 设成 0.1，就十条里随机一条变语音，跟用户在说什么没关系。
 
 这个插件把那个骰子拿走，换成一次意图判断：
 
 - 用户说「你发段语音我听听」「我想听听你的声音」→ 判断要语音 → 回复转语音
 - 用户只是正常聊天、问问题、提到「语音」二字但不是在要求发语音 → 正常文字
+
+## 安装
+
+从插件市场搜索「语音意图回复」安装，或手动放置：
+
+```bash
+cd /path/to/astrbot/data/plugins
+git clone https://github.com/irislilymoon/astrbot_plugin_voice_intent
+```
+
+重启 AstrBot，在 WebUI 的插件配置里打开「启用语音意图回复」。
+需要先在「服务提供商」中配置好至少一个 TTS 提供商，插件本身不带 TTS 能力。
 
 ## 判断方式：Jev 或对话模型
 
