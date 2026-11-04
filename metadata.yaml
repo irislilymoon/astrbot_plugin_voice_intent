@@ -1,13 +1,26 @@
 name: astrbot_plugin_voice_intent
 display_name: 语音意图回复
-short_desc: AI 判断用户是否想听语音，想听才发语音，不想就发文字
-desc: 关掉 AstrBot 的概率语音回复，改由 AI 判断「用户是不是想听语音」：默认走 TypeSafe 的 Jev 做结构化判断，没配 Key 或调用失败时自动回退到对话模型。想听就发语音，不想听就发文字。
+short_desc: AI 判断用户是不是想听语音，想听才发语音，不想就发文字
+desc: >-
+  关掉 AstrBot 内置的概率语音回复，改由 AI 判断「用户是不是想听语音」：
+  默认走 TypeSafe 的 Jev 做结构化二分类判断，没配 Key 或调用失败时自动回退到对话模型。
+  想听就发语音，不想听就发文字；同时告诉模型语音由发送阶段自动合成，
+  并在执行层拦掉模型自己调 record 的尝试，避免它回一句「我发不了语音」。
 version: v0.2.2
-author: "irislilymoon"
+author: irislilymoon
 repo: https://github.com/irislilymoon/astrbot_plugin_voice_intent
 social_link: https://github.com/irislilymoon
+astrbot_version: ">=4.24.2"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - webchat
 tags:
   - 语音
   - TTS
+  - 语音回复
   - 意图判断
   - LLM
+  - Jev
+  - 自动回复
