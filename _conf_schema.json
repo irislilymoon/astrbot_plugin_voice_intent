@@ -1,0 +1,111 @@
+{
+  "enabled": {
+    "description": "启用语音意图回复",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后由 AI 判断要不要发语音；关闭则完全不管，回复一律走文字"
+  },
+  "disable_probability_tts": {
+    "description": "保持 TTS 开启但屏蔽概率触发",
+    "type": "bool",
+    "default": true,
+    "hint": "启用时保持内置语音状态为开启，只屏蔽概率触发，避免和意图判断叠加；插件停用后恢复 TTS 开关和概率触发的原值"
+  },
+  "tell_model_voice_auto": {
+    "description": "告诉模型「语音由系统自动转换」",
+    "type": "bool",
+    "default": true,
+    "hint": "在系统提示末尾追加一段声明：文字的语音化由发送阶段自动完成，模型不需要也无法自己发音频。可避免模型回答「我发不了语音 / 没有 TTS 接口」"
+  },
+  "strip_voice_tool": {
+    "description": "禁止模型用工具自己发语音",
+    "type": "bool",
+    "default": true,
+    "hint": "从 send_message_to_user 的说明中去掉 record，并在执行层拦截模型仍然发出的 record 调用：不访问沙箱，将本轮最终回复自动转为语音。图片/视频/文件的正常调用不受影响"
+  },
+  "use_jev": {
+    "description": "用 Jev 做结构化判断",
+    "type": "bool",
+    "default": true,
+    "hint": "Jev 是 TypeSafe 的 System One 模型，专门做「从几个选项里挑一个」的判断，快且稳定。关掉则改用下面的对话模型；没填 API Key 时会自动回退到对话模型"
+  },
+  "jev_api_key": {
+    "description": "TypeSafe API Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "在 console.typesafe.ai/keys 创建。留空则自动回退到对话模型"
+  },
+  "jev_model": {
+    "description": "Jev 模型",
+    "type": "string",
+    "default": "jev-latest",
+    "hint": "一般不用改"
+  },
+  "jev_base_url": {
+    "description": "Jev API 地址",
+    "type": "string",
+    "default": "https://api.typesafe.ai",
+    "hint": "支持填写 API 根地址、带 /v1 的地址或完整 /v1/systemone 端点；默认官方地址"
+  },
+  "jev_confidence": {
+    "description": "判为语音的最低置信度",
+    "type": "float",
+    "default": 0.6,
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    "hint": "Jev 会返回置信度，低于这个值按文字处理。调低更容易发语音，调高更保守"
+  },
+  "intent_provider": {
+    "description": "对话模型（Jev 关闭或不可用时使用）",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "留空时使用当前会话正在用的模型"
+  },
+  "intent_prompt": {
+    "description": "对话模型判断用的系统提示词",
+    "type": "text",
+    "default": "",
+    "hint": "只在走对话模型时生效，留空使用插件内置规则。自定义时必须保证模型只输出 YES 或 NO"
+  },
+  "judge_timeout": {
+    "description": "意图判断超时（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "判断和主回复是并发跑的，超时了按「不需要语音」处理，不会拖慢文字回复"
+  },
+  "include_context": {
+    "description": "判断时附带最近几条对话",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后「再来一段」这种省略式请求也能判断准；关闭则只看当前这一句，更省 token"
+  },
+  "max_chars": {
+    "description": "转语音的最大字数",
+    "type": "int",
+    "default": 300,
+    "hint": "回复超过这个字数就不转语音，直接发文字，避免长时间合成。填 0 表示不限"
+  },
+  "dual_output": {
+    "description": "语音 + 文字同时发",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后既发语音也保留原文字；关闭则只发语音"
+  },
+  "only_private": {
+    "description": "只在私聊生效",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后群聊一律文字，只有私聊才会考虑发语音"
+  },
+  "debug": {
+    "description": "输出调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "排查判断不准时打开，日志里会打印判断结果、置信度和耗时"
+  }
+}
