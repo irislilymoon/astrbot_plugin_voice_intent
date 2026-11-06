@@ -125,7 +125,7 @@ VOICE_TEXT_NOTE = (
 # 预筛：像不像在要语音。命中才值得把工具先给模型（判断并行跑），
 # 不命中就照旧后台并发判断，不阻塞主回复。
 _VOICE_HINT_RE = re.compile(
-    r"语音|声音|声线|嗓子|说句话|说一段|说一句|念给|念一遍|念一下|读给|读一遍"
+    r"语音|声音|声线|嗓子|说句话|说一段|说一句|说给|念给|念一遍|念一下|读给|读一遍"
     r"|唱|听听|开口|发条音|来一段|来句|用嘴"
 )
 
@@ -137,6 +137,12 @@ _VOICE_REPEAT_RE = re.compile(
     r"|还要|还想要|继续|接着来|接着|换一[个条段句种]|换换"
     r"|不够|没听够|多来|多说说|说多点|快点说|你倒是说"
     r")"
+)
+
+# 承接句里出现这些说法就是明确要文字：不走快路径，交回判断模型。
+# 排除的代价只是多一次判断请求，不会把该发的语音压成文字。
+_VOICE_OPT_OUT_RE = re.compile(
+    r"打字|用文字|文字回|写出来|别发语音|不要语音|不用语音|别念|别唱|不用念|语音太"
 )
 # 承接句本身很短，超过这个长度就当成新话题，不按上下文延续处理。
 _VOICE_REPEAT_MAX_CHARS = 20
@@ -458,6 +464,16 @@ class VoiceIntentPlugin(Star):
             content = self._scrub_voice_refusal(content)
         except Exception:
             pass
+
+        # 工具路径同样要卡字数：装饰阶段那条路有上限，这里不设上限的话，
+        # 模型一次塞进整篇文章就会把全文送去合成，白白消耗 TTS 额度。
+        max_chars = int(self.config.get("max_chars", 300) or 0)
+        if max_chars > 0 and len(content) > max_chars:
+            logger.info(
+                f"[voice_intent] send_voice 内容 {len(content)} 字，超过上限 "
+                f"{max_chars}，改发文字"
+            )
+            return await self._answer_as_text(event, content, reason="tts")
 
         try:
             tts = await self._resolve_tts_provider(event)
@@ -946,6 +962,8 @@ class VoiceIntentPlugin(Star):
         """上一轮是语音时，判断本轮是不是「就着语音形态」的短承接。"""
         text = (text or "").strip()
         if not text or len(text) > _VOICE_REPEAT_MAX_CHARS:
+            return False
+        if _VOICE_OPT_OUT_RE.search(text):
             return False
         return bool(_VOICE_REPEAT_RE.search(text))
 
