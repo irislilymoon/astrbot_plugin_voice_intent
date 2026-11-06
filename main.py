@@ -491,7 +491,7 @@ class VoiceIntentPlugin(Star):
 
         # TTS 服务端偶发几十秒不回，工具层 120 秒才超时，那段时间用户收不到
         # 任何消息，整轮也被占住。这里自己设上限，超时就直接把文字发出去。
-        timeout = float(self.config.get("voice_timeout", 25) or 25)
+        timeout = float(self.config.get("voice_timeout", 45) or 45)
         try:
             audio_path = await self._synthesize(tts, content, timeout)
         except asyncio.TimeoutError:
@@ -604,29 +604,34 @@ class VoiceIntentPlugin(Star):
         return "已按文字发送给用户。本轮不需要再输出正文。"
 
     async def _synthesize(self, tts, text: str, timeout: float) -> str | None:
-        """串行调用 TTS 合成，429 时退避重试一次。
+        """合成一段语音，默认排队串行；`parallel_tts` 打开时允许多段同时合成。
 
         mimo 音色复刻同一账号只允许一路并发，第二个请求直接返回 429。QQ 连发
-        消息时多个 event 会同时走到这里，所以先把合成排成队：后到的等前一段
-        做完，而不是并发打过去被拒。429 本身是瞬时限制，等 0.8 秒重试一次
-        通常就能过；仍然失败再交回调用方转文字。
+        消息时多个 event 会同时走到这里，所以默认把合成排成队：后到的等前一段
+        做完，而不是并发打过去被拒。并发是否开启由 `parallel_tts` 控制。
         """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
+        if bool(self.config.get("parallel_tts", False)):
+            return await self._synthesize_once(tts, text, deadline)
         async with _TTS_LOCK:
-            for attempt in (1, 2):
-                remaining = deadline - loop.time()
-                if remaining <= 0.5:
-                    raise asyncio.TimeoutError
-                try:
-                    return await asyncio.wait_for(tts.get_audio(text), timeout=remaining)
-                except asyncio.TimeoutError:
+            return await self._synthesize_once(tts, text, deadline)
+
+    async def _synthesize_once(self, tts, text: str, deadline: float) -> str | None:
+        """单段合成，429 时退避重试一次；仍然失败就抛给调用方转文字。"""
+        loop = asyncio.get_running_loop()
+        for attempt in (1, 2):
+            remaining = deadline - loop.time()
+            if remaining <= 0.5:
+                raise asyncio.TimeoutError
+            try:
+                return await asyncio.wait_for(tts.get_audio(text), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise
+            except Exception as e:
+                if attempt == 2 or "429" not in str(e):
                     raise
-                except Exception as e:
-                    if attempt == 2 or "429" not in str(e):
-                        raise
-                    logger.info("[voice_intent] TTS 返回 429，0.8 秒后重试一次")
-                    await asyncio.sleep(min(0.8, max(deadline - loop.time(), 0.0)))
+                logger.info("[voice_intent] TTS 返回 429，0.8 秒后重试一次")
+                await asyncio.sleep(min(0.8, max(deadline - loop.time(), 0.0)))
         return None
 
     def _halt_agent(self, event: AstrMessageEvent) -> None:
@@ -1517,7 +1522,7 @@ class VoiceIntentPlugin(Star):
                     text = self._scrub_voice_refusal(text)
                 except Exception:
                     text = str(comp.text)
-                timeout = float(self.config.get("voice_timeout", 25) or 25)
+                timeout = float(self.config.get("voice_timeout", 45) or 45)
                 try:
                     audio_path = await self._synthesize(tts, text, timeout)
                 except asyncio.TimeoutError:
@@ -1629,6 +1634,8 @@ class VoiceIntentPlugin(Star):
             f"并行判断：{'开（不等判断，先给工具）' if parallel else '关（先等判断再决定）'}"
         )
         lines.append("收尾：发出语音后立即结束本轮")
+        serial = not bool(self.config.get("parallel_tts", False))
+        lines.append(f"合成并发：{'关（排队串行）' if serial else '开（多段同时合成）'}")
 
         yield event.plain_result("\n".join(lines))
 
