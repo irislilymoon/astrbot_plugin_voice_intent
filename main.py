@@ -47,6 +47,14 @@ for _mod_name in ("astrbot.core.agent.message", "astrbot.api.provider"):
         break
 
 try:
+    from astrbot.core.message.message_event_result import MessageChain
+except Exception:  # 兼容旧版本
+    try:
+        from astrbot.api.all import MessageChain  # type: ignore
+    except Exception:
+        MessageChain = None  # type: ignore
+
+try:
     from astrbot.core.star.session_llm_manager import SessionServiceManager
 except Exception:  # pragma: no cover
     SessionServiceManager = None  # type: ignore
@@ -61,6 +69,13 @@ _FLAG_KEY = "_voice_intent_done"
 _PROMPT_KEY = "_voice_intent_prompt_applied"
 # 模型即使无视工具 schema 仍尝试发 record，也以这次调用作为明确的语音意图
 _FORCE_VOICE_KEY = "_voice_intent_force_voice"
+
+# 是否本轮已经是语音、并且已经通过工具发出去过
+_VOICE_SENT_KEY = "_voice_intent_voice_sent"
+# 本轮判定结果（是否语音），决定 send_voice 工具在不在模型眼前
+_VOICE_MODE_KEY = "_voice_intent_voice_mode"
+# 模型用来「主动说一句语音」的工具名
+_VOICE_TOOL_NAME = "send_voice"
 
 # 内置「给用户发消息」工具，智能体模式下模型会用它尝试自己发语音
 _SEND_TOOL_NAME = "send_message_to_user"
@@ -90,6 +105,22 @@ VOICE_USER_NOTE = (
     "也不要说自己没有语音功能——语音通道不在你的判断范围内，"
     "说这些话就是错的。\n"
     "</voice_reply_notice>"
+)
+
+# 工具模式下用这句，比上面短得多：只告诉模型「调哪个工具」，不再解释原理。
+VOICE_TOOL_NOTE = (
+    "\n" + VOICE_USER_NOTE_MARK + "\n"
+    "（系统提示，用户看不到）本轮用户要的是语音回复。\n"
+    "调用 send_voice 工具，把要对用户说的话完整放进 text；"
+    "不要输出正文，也不要说自己发不出声音。\n"
+    "</voice_reply_notice>"
+)
+
+# 预筛：像不像在要语音。命中才值得等判断结果（Jev 约 1~2 秒），
+# 不命中就照旧后台并发判断，不阻塞主回复。
+_VOICE_HINT_RE = re.compile(
+    r"语音|声音|声线|嗓子|说句话|说一段|说一句|念给|念一遍|念一下|读给|读一遍"
+    r"|唱|听听|开口|发条音|来一段|来句|用嘴"
 )
 
 # 执行层兜底：即使模型还是写了「发不出声音」，转语音前把这句摘掉，
@@ -379,6 +410,89 @@ class VoiceIntentPlugin(Star):
                 "[voice_intent] 概率触发屏蔽失败，临时关闭内置 TTS 以避免重复语音"
             )
 
+    # ---------------- 语音工具（模型真正看得见的能力声明） ----------------
+
+    @filter.llm_tool(name=_VOICE_TOOL_NAME)
+    async def send_voice(self, event: AstrMessageEvent, text: str) -> str:
+        """用语音把这段话讲给用户听。用户想听声音、要一条语音、让你念或唱时调用。
+
+        Args:
+            text(string): 要念给用户听的内容。用口语写，不要 Markdown、表情符号、括号动作。
+        """
+        content = str(text or "").strip()
+        if not content:
+            return "text 为空，没有发送。"
+        if event.get_extra(_VOICE_SENT_KEY):
+            return "本轮已经发过语音了，不要重复发送。"
+        if bool(self.config.get("scrub_voice_refusal", True)):
+            try:
+                content = self._scrub_voice_refusal(content)
+            except Exception:
+                pass
+
+        try:
+            tts = await self._resolve_tts_provider(event)
+        except Exception as e:
+            logger.warning(f"[voice_intent] 获取 TTS 提供商失败：{e}")
+            tts = None
+        if tts is None:
+            return "当前会话没有可用的语音提供商，请改用普通文字回复。"
+
+        try:
+            audio_path = await tts.get_audio(content)
+        except Exception as e:
+            logger.error(f"[voice_intent] send_voice 合成失败：{e}")
+            return "语音合成失败，请改用普通文字回复。"
+        if not audio_path:
+            return "语音合成没有返回文件，请改用普通文字回复。"
+
+        url = await self._register_audio_url(event, audio_path)
+        if MessageChain is None:
+            return "当前环境不支持发送语音，请改用普通文字回复。"
+
+        try:
+            await event.send(
+                MessageChain(
+                    chain=[
+                        Comp.Record(
+                            file=url or audio_path,
+                            url=url or audio_path,
+                            text=content,
+                        )
+                    ]
+                )
+            )
+        except Exception as e:
+            logger.error(f"[voice_intent] send_voice 发送失败：{e}")
+            return "语音发送失败，请改用普通文字回复。"
+
+        event.set_extra(_VOICE_SENT_KEY, True)
+        logger.info(f"[voice_intent] send_voice 已发送语音（{len(content)} 字）")
+        return (
+            "语音已发送给用户。不要再重复这段内容，本轮不需要再输出正文，"
+            "也不要说自己发不出声音。"
+        )
+
+    async def _register_audio_url(
+        self, event: AstrMessageEvent, audio_path: str
+    ) -> str | None:
+        """按配置决定要不要把音频转成外链，失败就退回本地路径。"""
+        try:
+            conf = self.context.get_config(event.unified_msg_origin) or {}
+            tts_settings = conf.get("provider_tts_settings") or {}
+            callback_api_base = str(conf.get("callback_api_base") or "")
+            if not bool(tts_settings.get("use_file_service", False)) or not callback_api_base:
+                return None
+            from astrbot.core import file_token_service
+
+            token = file_token_service.register_file(audio_path)
+            if asyncio.iscoroutine(token):
+                token = await token
+            return f"{callback_api_base}/api/file/{token}"
+        except Exception as e:
+            logger.warning(f"[voice_intent] 注册语音文件失败，改用本地路径：{e}")
+            return None
+
     # ---------------- 意图判断（与主回复并发） ----------------
 
     @filter.on_llm_request()
@@ -391,28 +505,86 @@ class VoiceIntentPlugin(Star):
             if not await self._session_tts_enabled(event):
                 return
 
-            # 每次都尝试，工具循环里每一步可能是新的 req 对象；内部有去重标记
-            self._prepare_voice_context(req)
-
-            if event.get_extra(_FLAG_KEY):
-                return
-            if event.get_extra(_TASK_KEY) is not None:
-                return
-
-            event.set_extra(_FLAG_KEY, True)
-            task = asyncio.create_task(self._judge(event, req))
-            # 任务异常在这里被消费掉，避免 "exception was never retrieved" 警告
-            task.add_done_callback(lambda t: t.cancelled() or t.exception())
-            event.set_extra(_TASK_KEY, task)
+            if bool(self.config.get("use_voice_tool", True)):
+                await self._sync_voice_tool(event, req)
+            else:
+                # 老方案：往提示词里灌说明，靠模型自觉
+                self._prepare_voice_context(req)
+                self._start_background_judge(event, req)
         except Exception:
             logger.error("[voice_intent] 启动意图判断失败：\n" + traceback.format_exc())
 
-    def _prepare_voice_context(self, req) -> None:
+    def _start_background_judge(self, event: AstrMessageEvent, req) -> None:
+        if event.get_extra(_FLAG_KEY):
+            return
+        if event.get_extra(_TASK_KEY) is not None:
+            return
+        event.set_extra(_FLAG_KEY, True)
+        task = asyncio.create_task(self._judge(event, req))
+        # 任务异常在这里被消费掉，避免 "exception was never retrieved" 警告
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        event.set_extra(_TASK_KEY, task)
+
+    async def _sync_voice_tool(self, event: AstrMessageEvent, req) -> None:
+        """按本轮判断结果决定 send_voice 工具是否出现在模型眼前。
+
+        工具是模型唯一真正会读的能力清单（tools 字段），比在几万字系统提示
+        末尾加一段话可靠得多。判为文字时把工具摘掉，避免模型见谁都念。
+        结论缓存在事件上，工具循环的后续请求沿用，不会重复判断。
+        """
+        mode = event.get_extra(_VOICE_MODE_KEY)
+
+        if mode is None:
+            text = (event.message_str or "").strip()
+            if _VOICE_HINT_RE.search(text):
+                # 看着像要语音：值得先等判断结果，再决定工具可见性
+                task = asyncio.create_task(self._judge(event, req))
+                task.add_done_callback(lambda t: t.cancelled() or t.exception())
+                event.set_extra(_FLAG_KEY, True)
+                event.set_extra(_TASK_KEY, task)
+                mode = await self._await_judge(task)
+                event.set_extra(_VOICE_MODE_KEY, bool(mode))
+                logger.info(
+                    f"[voice_intent] 预判为{'语音' if mode else '文字'}，"
+                    f"send_voice 工具{'已提供' if mode else '已摘除'}"
+                )
+            else:
+                # 不像要语音：不阻塞主回复，判断结果只留给发送阶段兜底
+                self._start_background_judge(event, req)
+                event.set_extra(_VOICE_MODE_KEY, False)
+                mode = False
+
+        # 工具循环的第二步起 req 可能是新对象，这里每次都要重新对齐
+        if event.get_extra(_VOICE_SENT_KEY):
+            # 已经发过了，别再让模型看见工具，免得重复发
+            self._drop_voice_tool(req)
+            return
+        if mode:
+            self._prepare_voice_context(req, inject_prompt=False)
+            self._inject_user_turn_note(req, VOICE_TOOL_NOTE)
+        else:
+            self._drop_voice_tool(req)
+            self._prepare_voice_context(req, inject_prompt=False)
+
+    def _drop_voice_tool(self, req) -> None:
+        """把 send_voice 从本次请求的工具集里摘掉（只影响这次请求）。"""
+        toolset = getattr(req, "func_tool", None)
+        if toolset is None:
+            return
+        try:
+            toolset.remove_tool(_VOICE_TOOL_NAME)
+        except Exception:
+            logger.warning("[voice_intent] 摘除语音工具失败")
+
+    def _prepare_voice_context(self, req, inject_prompt: bool = True) -> None:
         """让模型知道语音是自动的，并堵掉它「自己发语音」的那条路。
 
         模型在智能体模式下会主动调 send_message_to_user 发 record，沙箱没开就会
         收到一条错误，然后当真事告诉用户「我发不了语音」。语音其实是发送阶段
         由 TTS 合成后发出去的，模型完全看不到，所以这个误会会一直自我强化。
+
+        ``inject_prompt=False`` 用于工具模式：不再往系统提示灌长段说明，
+        只在语音轮贴一句「调用 send_voice」的短提示。
         """
         if getattr(req, _PROMPT_KEY, False):
             return
@@ -422,13 +594,13 @@ class VoiceIntentPlugin(Star):
             # req 不允许挂自定义属性时仍然继续，宁可重复一次也不要漏掉
             pass
 
-        if bool(self.config.get("tell_model_voice_auto", True)):
+        if inject_prompt and bool(self.config.get("tell_model_voice_auto", True)):
             try:
                 req.system_prompt = f"{getattr(req, 'system_prompt', '') or ''}{VOICE_AUTO_PROMPT}"
             except Exception:
                 logger.warning("[voice_intent] 追加语音说明失败")
             if bool(self.config.get("voice_note_in_user_turn", True)):
-                self._inject_user_turn_note(req)
+                self._inject_user_turn_note(req, VOICE_USER_NOTE)
 
         if bool(self.config.get("strip_voice_tool", True)):
             try:
@@ -436,7 +608,7 @@ class VoiceIntentPlugin(Star):
             except Exception:
                 logger.error("[voice_intent] 屏蔽语音工具失败：\n" + traceback.format_exc())
 
-    def _inject_user_turn_note(self, req) -> None:
+    def _inject_user_turn_note(self, req, note: str = VOICE_USER_NOTE) -> None:
         """把语音说明贴到本轮用户消息里，绕开「人格 / 框架提示太长冲淡」的问题。"""
         if TextPart is None:
             return
@@ -450,7 +622,7 @@ class VoiceIntentPlugin(Star):
         except Exception:
             return
         try:
-            parts.append(TextPart(text=VOICE_USER_NOTE))
+            parts.append(TextPart(text=note))
         except Exception:
             logger.warning("[voice_intent] 向用户消息追加语音说明失败")
 
@@ -913,6 +1085,15 @@ class VoiceIntentPlugin(Star):
         if not bool(self.config.get("enabled", True)):
             return
 
+        # 模型已经调过 send_voice：语音发出去了，这里只负责把重复的正文丢掉
+        if event.get_extra(_VOICE_SENT_KEY):
+            event.set_extra(_VOICE_SENT_KEY, None)
+            sent_result = event.get_result()
+            if sent_result is not None and sent_result.chain:
+                logger.info("[voice_intent] 本轮已用 send_voice 发过语音，丢弃重复正文")
+                sent_result.chain = []
+            return
+
         force_voice = bool(event.get_extra(_FORCE_VOICE_KEY))
         task = event.get_extra(_TASK_KEY)
         if task is not None:
@@ -1061,16 +1242,7 @@ class VoiceIntentPlugin(Star):
                     new_chain.append(comp)
                     continue
 
-                url = None
-                if use_file_service and callback_api_base:
-                    try:
-                        from astrbot.core import file_token_service
-
-                        token = await file_token_service.register_file(audio_path)
-                        url = f"{callback_api_base}/api/file/{token}"
-                    except Exception as e:
-                        logger.warning(f"[voice_intent] 注册语音文件失败，改用本地路径：{e}")
-                        url = None
+                url = await self._register_audio_url(event, audio_path)
 
                 new_chain.append(
                     Comp.Record(
@@ -1151,10 +1323,15 @@ class VoiceIntentPlugin(Star):
         except Exception:
             pass
 
+        use_tool = bool(self.config.get("use_voice_tool", True))
         tell = bool(self.config.get("tell_model_voice_auto", True))
         strip = bool(self.config.get("strip_voice_tool", True))
+        if use_tool:
+            model_side = "send_voice 工具（判为语音时提供给模型）"
+        else:
+            model_side = "已告知语音自动" if tell else "未告知"
         lines.append(
-            f"模型侧：{'已告知语音自动' if tell else '未告知'}"
+            f"模型侧：{model_side}"
             f" / {'已禁止工具发语音' if strip else '未限制工具发语音'}"
         )
 

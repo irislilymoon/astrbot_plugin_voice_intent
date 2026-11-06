@@ -11,11 +11,17 @@
     "default": true,
     "hint": "启用时保持内置语音状态为开启，只屏蔽概率触发，避免和意图判断叠加；插件停用后恢复 TTS 开关和概率触发的原值"
   },
+  "use_voice_tool": {
+    "description": "注册 send_voice 语音工具",
+    "type": "bool",
+    "default": true,
+    "hint": "推荐开启。判断为语音的那一轮，把 send_voice(text) 工具交给模型，让它直接调工具发语音；判为文字则把工具摘掉，避免乱发。工具是模型唯一真正会读的能力清单（tools 字段），比在几万字系统提示末尾加说明可靠得多，也避免长文稀释注意力。关闭则回到纯提示词方案"
+  },
   "tell_model_voice_auto": {
     "description": "告诉模型「语音由系统自动转换」",
     "type": "bool",
     "default": true,
-    "hint": "在系统提示末尾追加一段声明：文字的语音化由发送阶段自动完成，模型不需要也无法自己发音频。可避免模型回答「我发不了语音 / 没有 TTS 接口」"
+    "hint": "仅在关闭 send_voice 工具时生效：在系统提示末尾追加说明，告诉模型语音由发送阶段自动完成。开启工具后不再灌这段长提示"
   },
   "voice_note_in_user_turn": {
     "description": "把语音说明也贴进本轮用户消息",
