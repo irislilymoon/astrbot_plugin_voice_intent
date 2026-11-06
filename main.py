@@ -91,9 +91,13 @@ _STOP_KEY = "agent_stop_requested"
 _HALTED_KEY = "_voice_intent_halted"
 # 模型用来「主动说一句语音」的工具名
 _VOICE_TOOL_NAME = "send_voice"
-
 # 内置「给用户发消息」工具，智能体模式下模型会用它尝试自己发语音
 _SEND_TOOL_NAME = "send_message_to_user"
+
+# TTS 合成串行锁。mimo 音色复刻同一账号只允许一路并发，第二个请求直接
+# 返回 429；QQ 连发消息时多个 event 会同时走到合成这一步，不排队就只能
+# 收到文字。锁让后来的请求等前一个完成，而不是被服务端拒掉。
+_TTS_LOCK = asyncio.Lock()
 
 # 说明只贴进本轮用户消息，不再往系统提示末尾追加：系统提示前面常挂着几万字
 # 的人格 / 框架设定，末尾的说明会被冲淡，模型照样照人格演一个「用手机打字的人」。
@@ -487,9 +491,9 @@ class VoiceIntentPlugin(Star):
 
         # TTS 服务端偶发几十秒不回，工具层 120 秒才超时，那段时间用户收不到
         # 任何消息，整轮也被占住。这里自己设上限，超时就直接把文字发出去。
-        timeout = float(self.config.get("voice_timeout", 15) or 15)
+        timeout = float(self.config.get("voice_timeout", 25) or 25)
         try:
-            audio_path = await asyncio.wait_for(tts.get_audio(content), timeout=timeout)
+            audio_path = await self._synthesize(tts, content, timeout)
         except asyncio.TimeoutError:
             logger.warning(f"[voice_intent] 语音合成超过 {timeout:.0f}s，改发文字")
             return await self._answer_as_text(event, content, reason="tts")
@@ -598,6 +602,32 @@ class VoiceIntentPlugin(Star):
             logger.info(f"[voice_intent] 语音合成未完成，已按文字发出（{len(text)} 字）")
         self._halt_agent(event)
         return "已按文字发送给用户。本轮不需要再输出正文。"
+
+    async def _synthesize(self, tts, text: str, timeout: float) -> str | None:
+        """串行调用 TTS 合成，429 时退避重试一次。
+
+        mimo 音色复刻同一账号只允许一路并发，第二个请求直接返回 429。QQ 连发
+        消息时多个 event 会同时走到这里，所以先把合成排成队：后到的等前一段
+        做完，而不是并发打过去被拒。429 本身是瞬时限制，等 0.8 秒重试一次
+        通常就能过；仍然失败再交回调用方转文字。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        async with _TTS_LOCK:
+            for attempt in (1, 2):
+                remaining = deadline - loop.time()
+                if remaining <= 0.5:
+                    raise asyncio.TimeoutError
+                try:
+                    return await asyncio.wait_for(tts.get_audio(text), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise
+                except Exception as e:
+                    if attempt == 2 or "429" not in str(e):
+                        raise
+                    logger.info("[voice_intent] TTS 返回 429，0.8 秒后重试一次")
+                    await asyncio.sleep(min(0.8, max(deadline - loop.time(), 0.0)))
+        return None
 
     def _halt_agent(self, event: AstrMessageEvent) -> None:
         """让本轮的 agent 循环就地收尾。
@@ -1487,11 +1517,9 @@ class VoiceIntentPlugin(Star):
                     text = self._scrub_voice_refusal(text)
                 except Exception:
                     text = str(comp.text)
-                timeout = float(self.config.get("voice_timeout", 15) or 15)
+                timeout = float(self.config.get("voice_timeout", 25) or 25)
                 try:
-                    audio_path = await asyncio.wait_for(
-                        tts.get_audio(text), timeout=timeout
-                    )
+                    audio_path = await self._synthesize(tts, text, timeout)
                 except asyncio.TimeoutError:
                     logger.warning(
                         f"[voice_intent] 语音合成超过 {timeout:.0f}s，这段保留文字"
