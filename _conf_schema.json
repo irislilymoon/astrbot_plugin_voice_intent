@@ -84,6 +84,22 @@
     "default": false,
     "hint": "关闭：合成排队，后到的等前一段做完再发。开启：多轮同时合成。音色复刻接口同一账号只允许一路并发，同时发第二个请求会直接返回 429；插件会等 0.8 秒重试一次，仍失败则这一段降级为文字"
   },
+  "tts_fallback_enable": {
+    "description": "允许回退到备用语音提供商",
+    "type": "bool",
+    "default": true,
+    "hint": "主语音提供商合成失败（限流、报错）时，按顺序换下一个再试一次，这段因此仍能发出语音；关闭则失败就直接把这段文字发出去。超时不回退，避免一轮等太久"
+  },
+  "tts_fallback_provider_ids": {
+    "description": "回退语音提供商",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "_special": "select_providers",
+    "default": [],
+    "hint": "按顺序尝试，留空则自动取 Provider 里其余全部语音提供商。换一家音色就会变"
+  },
   "voice_timeout": {
     "description": "单段语音合成超时（秒）",
     "type": "int",
