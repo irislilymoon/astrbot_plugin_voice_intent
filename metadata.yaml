@@ -6,7 +6,7 @@ desc: >-
   默认走 TypeSafe 的 Jev 做结构化二分类判断，没配 Key 或调用失败时自动回退到对话模型。
   想听就发语音，不想听就发文字；同时告诉模型语音由发送阶段自动合成，
   并在执行层拦掉模型自己调 record 的尝试，避免它回一句「我发不了语音」。
-version: v0.2.2
+version: v0.2.3
 author: irislilymoon
 repo: https://github.com/irislilymoon/astrbot_plugin_voice_intent
 social_link: https://github.com/irislilymoon

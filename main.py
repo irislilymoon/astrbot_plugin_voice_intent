@@ -95,38 +95,20 @@ _VOICE_TOOL_NAME = "send_voice"
 # 内置「给用户发消息」工具，智能体模式下模型会用它尝试自己发语音
 _SEND_TOOL_NAME = "send_message_to_user"
 
-# 追加到系统提示末尾的声明。目的只有一个：让模型不要自己去发音频，
-# 也不要因为发不出去就向用户宣告「我没有语音」——语音是发送阶段自动合成的。
-VOICE_AUTO_PROMPT = """
-
-<voice_reply>
-本会话的语音回复由系统自动完成：你输出的文字会在发送阶段被自动合成为语音发给用户。
-你不需要、也无法自己生成或发送音频文件。
-- 不要调用 send_message_to_user 发送 record / 语音 / 音频组件。
-- 用户要求语音时，正常用文字回答即可，系统会把它变成语音。
-- 不要说「我发不了语音」「没有 TTS 接口」「缺少音色」「沙箱未启用」这类话；
-  你并不掌握语音通道的状态，这类判断一律是错误的。
-</voice_reply>"""
-
-# 只放在系统提示末尾不够：系统提示前面常挂着几万字的人格 / 框架设定，
-# 模型会照人格演一个「用手机打字的人」，照样回「我发不出声音」。
-# 因此再往「本轮用户消息」里贴一段，位置最靠近用户诉求，权重最高。
+# 说明只贴进本轮用户消息，不再往系统提示末尾追加：系统提示前面常挂着几万字
+# 的人格 / 框架设定，末尾的说明会被冲淡，模型照样照人格演一个「用手机打字的人」。
+# 用户消息里的位置最靠近用户诉求，权重最高。
 VOICE_USER_NOTE_MARK = "<voice_reply_notice>"
-VOICE_USER_NOTE = (
-    "\n" + VOICE_USER_NOTE_MARK + "\n"
-    "（系统提示，用户看不到，不要复述本段）\n"
-    "本轮回复会由系统在发送阶段自动合成为语音，你只负责把话写出来。\n"
-    "禁止说「发不出声音 / 发不了语音 / 没法发语音 / 只能打字」这类话，"
-    "也不要说自己没有语音功能——语音通道不在你的判断范围内，"
-    "说这些话就是错的。\n"
-    "</voice_reply_notice>"
-)
 
-# 工具模式下用这句，比上面短得多：只告诉模型「调哪个工具」，不再解释原理。
+# 语音轮用这条：一是指路（调 send_voice），二是声明语音由系统转换，
+# 三是堵掉模型自己调工具发音频那条路——沙箱没开时那条调用只会换来一个错误，
+# 模型会把它当真事告诉用户「我发不了语音」。
 VOICE_TOOL_NOTE = (
     "\n" + VOICE_USER_NOTE_MARK + "\n"
     "（系统提示，用户看不到）本轮用户要的是语音回复。\n"
-    "调用 send_voice 工具，把要对用户说的话完整放进 text；"
+    "调用 send_voice 工具，把要对用户说的话完整放进 text。\n"
+    "语音由系统自动转换：你不生成、也无法自己发送音频文件，"
+    "不要调用其他工具发送 record / 语音 / 音频组件。\n"
     "不要输出正文，也不要说自己发不出声音。\n"
     "</voice_reply_notice>"
 )
@@ -333,7 +315,7 @@ def _retry_delay(resp, attempt: int) -> float:
     PLUGIN_NAME,
     "irislilymoon",
     "按 AI 意图判断决定发语音还是发文字：自动关掉内置概率语音，想听声音才发语音",
-    "0.2.2",
+    "0.2.3",
 )
 class VoiceIntentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -471,11 +453,11 @@ class VoiceIntentPlugin(Star):
         if await self._resolve_tool_voice_mode(event) is False:
             return await self._answer_as_text(event, content)
 
-        if bool(self.config.get("scrub_voice_refusal", True)):
-            try:
-                content = self._scrub_voice_refusal(content)
-            except Exception:
-                pass
+        # 语音里冒出「我发不出声音」是自相矛盾的，合成前一定先摘掉这类句子
+        try:
+            content = self._scrub_voice_refusal(content)
+        except Exception:
+            pass
 
         try:
             tts = await self._resolve_tts_provider(event)
@@ -609,8 +591,6 @@ class VoiceIntentPlugin(Star):
         中止信号砍掉它，省掉几秒到十几秒空转，也避免会话被占着导致用户
         连发的消息排队。
         """
-        if not bool(self.config.get("stop_after_voice_tool", True)):
-            return
         try:
             event.set_extra(_HALTED_KEY, True)
             event.set_extra(_STOP_KEY, True)
@@ -649,12 +629,7 @@ class VoiceIntentPlugin(Star):
             if not await self._session_tts_enabled(event):
                 return
 
-            if bool(self.config.get("use_voice_tool", True)):
-                await self._sync_voice_tool(event, req)
-            else:
-                # 老方案：往提示词里灌说明，靠模型自觉
-                self._prepare_voice_context(req)
-                self._start_background_judge(event, req)
+            await self._sync_voice_tool(event, req)
         except Exception:
             logger.error("[voice_intent] 启动意图判断失败：\n" + traceback.format_exc())
 
@@ -728,11 +703,11 @@ class VoiceIntentPlugin(Star):
 
         # 工具循环的第二步起 req 可能是新对象，这里每次都要重新对齐
         if mode is True or mode == _MODE_PENDING:
-            self._prepare_voice_context(req, inject_prompt=False)
+            self._prepare_voice_context(req)
             self._inject_user_turn_note(req, VOICE_TOOL_NOTE)
         else:
             self._drop_voice_tool(req)
-            self._prepare_voice_context(req, inject_prompt=False)
+            self._prepare_voice_context(req)
             if self._session_was_voice(event):
                 # 上一轮发过语音，这一轮按文字回。模型在上下文里见过 send_voice
                 # 的调用记录，工具一消失就容易答「这轮没有相关工具」，堵掉这句。
@@ -748,15 +723,12 @@ class VoiceIntentPlugin(Star):
         except Exception:
             logger.warning("[voice_intent] 摘除语音工具失败")
 
-    def _prepare_voice_context(self, req, inject_prompt: bool = True) -> None:
-        """让模型知道语音是自动的，并堵掉它「自己发语音」的那条路。
+    def _prepare_voice_context(self, req) -> None:
+        """堵掉模型「自己发语音」的那条路。
 
         模型在智能体模式下会主动调 send_message_to_user 发 record，沙箱没开就会
-        收到一条错误，然后当真事告诉用户「我发不了语音」。语音其实是发送阶段
-        由 TTS 合成后发出去的，模型完全看不到，所以这个误会会一直自我强化。
-
-        ``inject_prompt=False`` 用于工具模式：不再往系统提示灌长段说明，
-        只在语音轮贴一句「调用 send_voice」的短提示。
+        收到一条错误，然后当真事告诉用户「我发不了语音」。语音其实由发送阶段的
+        TTS 合成后发出，模型完全看不到，这个误会会一直自我强化。
         """
         if getattr(req, _PROMPT_KEY, False):
             return
@@ -766,21 +738,12 @@ class VoiceIntentPlugin(Star):
             # req 不允许挂自定义属性时仍然继续，宁可重复一次也不要漏掉
             pass
 
-        if inject_prompt and bool(self.config.get("tell_model_voice_auto", True)):
-            try:
-                req.system_prompt = f"{getattr(req, 'system_prompt', '') or ''}{VOICE_AUTO_PROMPT}"
-            except Exception:
-                logger.warning("[voice_intent] 追加语音说明失败")
-            if bool(self.config.get("voice_note_in_user_turn", True)):
-                self._inject_user_turn_note(req, VOICE_USER_NOTE)
+        try:
+            self._strip_voice_component(req)
+        except Exception:
+            logger.error("[voice_intent] 屏蔽语音工具失败：\n" + traceback.format_exc())
 
-        if bool(self.config.get("strip_voice_tool", True)):
-            try:
-                self._strip_voice_component(req)
-            except Exception:
-                logger.error("[voice_intent] 屏蔽语音工具失败：\n" + traceback.format_exc())
-
-    def _inject_user_turn_note(self, req, note: str = VOICE_USER_NOTE) -> None:
+    def _inject_user_turn_note(self, req, note: str = VOICE_TOOL_NOTE) -> None:
         """把语音说明贴到本轮用户消息里，绕开「人格 / 框架提示太长冲淡」的问题。"""
         if TextPart is None:
             return
@@ -1499,15 +1462,13 @@ class VoiceIntentPlugin(Star):
 
         new_chain: list = []
         converted = 0
-        scrub = bool(self.config.get("scrub_voice_refusal", True))
         for comp in result.chain:
             if isinstance(comp, Comp.Plain) and len(str(comp.text or "")) > 1:
                 text = str(comp.text)
-                if scrub:
-                    try:
-                        text = self._scrub_voice_refusal(text)
-                    except Exception:
-                        text = str(comp.text)
+                try:
+                    text = self._scrub_voice_refusal(text)
+                except Exception:
+                    text = str(comp.text)
                 timeout = float(self.config.get("voice_timeout", 15) or 15)
                 try:
                     audio_path = await asyncio.wait_for(
@@ -1611,30 +1572,17 @@ class VoiceIntentPlugin(Star):
         except Exception:
             pass
 
-        use_tool = bool(self.config.get("use_voice_tool", True))
-        tell = bool(self.config.get("tell_model_voice_auto", True))
-        strip = bool(self.config.get("strip_voice_tool", True))
         parallel = bool(self.config.get("parallel_judge", True))
-        stop_after = bool(self.config.get("stop_after_voice_tool", True))
-        if use_tool:
-            model_side = (
-                "send_voice 工具（判断并行，执行时裁决）"
-                if parallel
-                else "send_voice 工具（判为语音时提供给模型）"
-            )
-        else:
-            model_side = "已告知语音自动" if tell else "未告知"
-        lines.append(
-            f"模型侧：{model_side}"
-            f" / {'已禁止工具发语音' if strip else '未限制工具发语音'}"
+        model_side = (
+            "send_voice 工具（判断并行，执行时裁决）"
+            if parallel
+            else "send_voice 工具（判为语音时提供给模型）"
         )
-        if use_tool:
-            lines.append(
-                f"并行判断：{'开（不等判断，先给工具）' if parallel else '关（先等判断再决定）'}"
-            )
+        lines.append(f"模型侧：{model_side} / 已禁止工具发语音")
         lines.append(
-            f"收尾：{'发出后立即结束本轮' if stop_after else '等模型再生成一轮（内容丢弃）'}"
+            f"并行判断：{'开（不等判断，先给工具）' if parallel else '关（先等判断再决定）'}"
         )
+        lines.append("收尾：发出语音后立即结束本轮")
 
         yield event.plain_result("\n".join(lines))
 
