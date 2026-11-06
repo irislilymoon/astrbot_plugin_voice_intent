@@ -1487,6 +1487,10 @@ class VoiceIntentPlugin(Star):
             f"模型侧：{model_side}"
             f" / {'已禁止工具发语音' if strip else '未限制工具发语音'}"
         )
+        if use_tool:
+            lines.append(
+                f"并行判断：{'开（不等判断，先给工具）' if parallel else '关（先等判断再决定）'}"
+            )
         lines.append(
             f"收尾：{'发出后立即结束本轮' if stop_after else '等模型再生成一轮（内容丢弃）'}"
         )
