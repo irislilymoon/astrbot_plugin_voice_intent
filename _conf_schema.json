@@ -114,6 +114,12 @@
     "default": true,
     "hint": "开启后「再来一段」这种省略式请求也能判断准；关闭则只看当前这一句，更省 token"
   },
+  "voice_timeout": {
+    "description": "单段语音合成超时（秒）",
+    "type": "int",
+    "default": 15,
+    "hint": "超过这个时间还没合成完，就放弃语音、把这段文字直接发出去。TTS 服务端偶发几十秒不响应，不设上限会让整轮一直卡住、用户收不到任何消息"
+  },
   "max_chars": {
     "description": "转语音的最大字数",
     "type": "int",

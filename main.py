@@ -483,35 +483,50 @@ class VoiceIntentPlugin(Star):
             logger.warning(f"[voice_intent] 获取 TTS 提供商失败：{e}")
             tts = None
         if tts is None:
-            return "当前会话没有可用的语音提供商，请改用普通文字回复。"
+            return await self._answer_as_text(
+                event, content, reason="tts"
+            ) or "当前会话没有可用的语音提供商，已改用文字。"
 
+        # TTS 服务端偶发几十秒不回，工具层 120 秒才超时，那段时间用户收不到
+        # 任何消息，整轮也被占住。这里自己设上限，超时就直接把文字发出去。
+        timeout = float(self.config.get("voice_timeout", 15) or 15)
         try:
-            audio_path = await tts.get_audio(content)
+            audio_path = await asyncio.wait_for(tts.get_audio(content), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[voice_intent] 语音合成超过 {timeout:.0f}s，改发文字")
+            return await self._answer_as_text(event, content, reason="tts")
         except Exception as e:
             logger.error(f"[voice_intent] send_voice 合成失败：{e}")
-            return "语音合成失败，请改用普通文字回复。"
+            return await self._answer_as_text(event, content, reason="tts")
         if not audio_path:
-            return "语音合成没有返回文件，请改用普通文字回复。"
+            logger.warning("[voice_intent] 语音合成没有返回文件，改发文字")
+            return await self._answer_as_text(event, content, reason="tts")
 
         url = await self._register_audio_url(event, audio_path)
         if MessageChain is None:
             return "当前环境不支持发送语音，请改用普通文字回复。"
 
         try:
-            await event.send(
-                MessageChain(
-                    chain=[
-                        Comp.Record(
-                            file=url or audio_path,
-                            url=url or audio_path,
-                            text=content,
-                        )
-                    ]
-                )
+            await asyncio.wait_for(
+                event.send(
+                    MessageChain(
+                        chain=[
+                            Comp.Record(
+                                file=url or audio_path,
+                                url=url or audio_path,
+                                text=content,
+                            )
+                        ]
+                    )
+                ),
+                timeout=max(timeout, 10.0),
             )
+        except asyncio.TimeoutError:
+            logger.warning("[voice_intent] 语音发送超时，改发文字")
+            return await self._answer_as_text(event, content, reason="tts")
         except Exception as e:
             logger.error(f"[voice_intent] send_voice 发送失败：{e}")
-            return "语音发送失败，请改用普通文字回复。"
+            return await self._answer_as_text(event, content, reason="tts")
 
         event.set_extra(_VOICE_SENT_KEY, True)
         self._mark_session_voice(event)
@@ -557,22 +572,32 @@ class VoiceIntentPlugin(Star):
             return False
         return True if mode in (True, None) else None
 
-    async def _answer_as_text(self, event: AstrMessageEvent, text: str) -> str:
-        """判断为文字但模型已经调了语音工具：把这段文本原样按文字发出去。
+    async def _answer_as_text(
+        self, event: AstrMessageEvent, text: str, reason: str = "judge"
+    ) -> str:
+        """把这段话原样按文字发出去，不再走语音。
 
-        这样不产生第二轮 LLM，用户也不会收到一条「其实不该发」的语音。
+        reason="judge"：判断结论是文字；reason="tts"：语音合成超时或失败。
+        两种情况都不产生第二轮 LLM，用户不会因为等语音而长时间收不到消息。
         """
         if MessageChain is None:
-            return "本轮不需要语音，请直接用文字回复。"
+            return "本轮不再发语音，请直接用文字回复。"
         try:
             await event.send(MessageChain(chain=[Comp.Plain(text=text)]))
         except Exception as e:
             logger.error(f"[voice_intent] 按文字补发失败：{e}")
-            return "本轮不需要语音，请直接用文字回复。"
+            return "本轮不再发语音，请直接用文字回复。"
 
         event.set_extra(_VOICE_SENT_KEY, True)
-        self._clear_session_voice(event)
-        logger.info(f"[voice_intent] 判为文字，send_voice 内容已按文字发出（{len(text)} 字）")
+        if reason == "judge":
+            # 判为文字说明形态已经变了，下一轮不该再按「承接上一轮语音」处理
+            self._clear_session_voice(event)
+            logger.info(
+                f"[voice_intent] 判为文字，send_voice 内容已按文字发出（{len(text)} 字）"
+            )
+        else:
+            # 语音意图仍然成立，只是这次合成没成功，保留会话记忆
+            logger.info(f"[voice_intent] 语音合成未完成，已按文字发出（{len(text)} 字）")
         self._halt_agent(event)
         return "已按文字发送给用户。本轮不需要再输出正文。"
 
@@ -1483,8 +1508,17 @@ class VoiceIntentPlugin(Star):
                         text = self._scrub_voice_refusal(text)
                     except Exception:
                         text = str(comp.text)
+                timeout = float(self.config.get("voice_timeout", 15) or 15)
                 try:
-                    audio_path = await tts.get_audio(text)
+                    audio_path = await asyncio.wait_for(
+                        tts.get_audio(text), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[voice_intent] 语音合成超过 {timeout:.0f}s，这段保留文字"
+                    )
+                    new_chain.append(comp)
+                    continue
                 except Exception as e:
                     logger.error(f"[voice_intent] 语音合成失败，保留文字：{e}")
                     new_chain.append(comp)
