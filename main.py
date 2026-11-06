@@ -61,6 +61,13 @@ except Exception:  # pragma: no cover
 
 PLUGIN_NAME = "astrbot_plugin_voice_intent"
 
+# on_agent_done 钩子在旧版本里没有，取不到就退化成空装饰器
+try:
+    _on_agent_done_decorator = filter.on_agent_done()
+except Exception:  # pragma: no cover
+    def _on_agent_done_decorator(fn):  # type: ignore
+        return fn
+
 # event extras 里存并发判断任务的 key
 _TASK_KEY = "_voice_intent_task"
 # 已经处理过判断的标记，避免工具循环重复触发
@@ -70,10 +77,18 @@ _PROMPT_KEY = "_voice_intent_prompt_applied"
 # 模型即使无视工具 schema 仍尝试发 record，也以这次调用作为明确的语音意图
 _FORCE_VOICE_KEY = "_voice_intent_force_voice"
 
-# 是否本轮已经是语音、并且已经通过工具发出去过
+# 本轮是否已经直接把答复发出去过（语音或文字），装饰阶段据此丢弃重复正文
 _VOICE_SENT_KEY = "_voice_intent_voice_sent"
-# 本轮判定结果（是否语音），决定 send_voice 工具在不在模型眼前
+# 本轮判定结果：True 语音 / False 文字 / _MODE_PENDING 还在并行判断
 _VOICE_MODE_KEY = "_voice_intent_voice_mode"
+_MODE_PENDING = "pending"
+# 判断是否真的拿到了结论（超时、失败都算没有结论，不能当成「判为文字」）
+_JUDGE_OK_KEY = "_voice_intent_judge_ok"
+# AstrBot 官方的协作式中止信号：置 True 后 agent 循环会在下一个检查点收尾，
+# 不再跑「工具返回后必须再喂给模型」的那第二轮回合
+_STOP_KEY = "agent_stop_requested"
+# 本轮是我们主动中止的，用于在 on_agent_done 里清掉框架写进历史的骨架消息
+_HALTED_KEY = "_voice_intent_halted"
 # 模型用来「主动说一句语音」的工具名
 _VOICE_TOOL_NAME = "send_voice"
 
@@ -116,7 +131,7 @@ VOICE_TOOL_NOTE = (
     "</voice_reply_notice>"
 )
 
-# 预筛：像不像在要语音。命中才值得等判断结果（Jev 约 1~2 秒），
+# 预筛：像不像在要语音。命中才值得把工具先给模型（判断并行跑），
 # 不命中就照旧后台并发判断，不阻塞主回复。
 _VOICE_HINT_RE = re.compile(
     r"语音|声音|声线|嗓子|说句话|说一段|说一句|念给|念一遍|念一下|读给|读一遍"
@@ -424,6 +439,13 @@ class VoiceIntentPlugin(Star):
             return "text 为空，没有发送。"
         if event.get_extra(_VOICE_SENT_KEY):
             return "本轮已经发过语音了，不要重复发送。"
+
+        # 并行判断：这个工具在判断出结论之前就先给了模型，所以执行时要先裁决。
+        # 判断任务从主回复开始就在跑，模型生成完这轮通常已有结论，几乎不额外等待。
+        # 判为文字时不报错、也不让模型再生成一轮，直接把这段文本当普通文字发出去。
+        if await self._resolve_tool_voice_mode(event) is False:
+            return await self._answer_as_text(event, content)
+
         if bool(self.config.get("scrub_voice_refusal", True)):
             try:
                 content = self._scrub_voice_refusal(content)
@@ -468,10 +490,80 @@ class VoiceIntentPlugin(Star):
 
         event.set_extra(_VOICE_SENT_KEY, True)
         logger.info(f"[voice_intent] send_voice 已发送语音（{len(content)} 字）")
+        self._halt_agent(event)
         return (
             "语音已发送给用户。不要再重复这段内容，本轮不需要再输出正文，"
             "也不要说自己发不出声音。"
         )
+
+    async def _resolve_tool_voice_mode(self, event: AstrMessageEvent) -> bool | None:
+        """工具执行时确认本轮到底要不要语音。
+
+        返回 True = 要语音；False = 明确判为文字；None = 没拿到结论（按语音处理）。
+        只有判断任务真的给出结论、且结果是否的时候才返回 False，超时和失败
+        一律返回 None，避免把「判断挂了」当成「用户不要语音」。
+        """
+        mode = event.get_extra(_VOICE_MODE_KEY)
+        if mode != _MODE_PENDING:
+            if mode is False and event.get_extra(_JUDGE_OK_KEY):
+                return False
+            return True if mode in (True, None) else None
+
+        task = event.get_extra(_TASK_KEY)
+        if task is not None:
+            if not task.done():
+                # 判断一般 2~5 秒，模型这一轮生成也差不多这个时间，通常不必等
+                budget = max(8.0, float(self.config.get("judge_timeout", 8) or 8) + 2)
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+                except Exception:
+                    pass
+            if task.done() and not task.cancelled():
+                try:
+                    mode = bool(task.result())
+                    event.set_extra(_VOICE_MODE_KEY, mode)
+                except Exception:
+                    mode = None
+            else:
+                mode = None
+
+        if mode is False and event.get_extra(_JUDGE_OK_KEY):
+            return False
+        return True if mode in (True, None) else None
+
+    async def _answer_as_text(self, event: AstrMessageEvent, text: str) -> str:
+        """判断为文字但模型已经调了语音工具：把这段文本原样按文字发出去。
+
+        这样不产生第二轮 LLM，用户也不会收到一条「其实不该发」的语音。
+        """
+        if MessageChain is None:
+            return "本轮不需要语音，请直接用文字回复。"
+        try:
+            await event.send(MessageChain(chain=[Comp.Plain(text=text)]))
+        except Exception as e:
+            logger.error(f"[voice_intent] 按文字补发失败：{e}")
+            return "本轮不需要语音，请直接用文字回复。"
+
+        event.set_extra(_VOICE_SENT_KEY, True)
+        logger.info(f"[voice_intent] 判为文字，send_voice 内容已按文字发出（{len(text)} 字）")
+        self._halt_agent(event)
+        return "已按文字发送给用户。本轮不需要再输出正文。"
+
+    def _halt_agent(self, event: AstrMessageEvent) -> None:
+        """让本轮的 agent 循环就地收尾。
+
+        function calling 要求工具结果回喂给模型、让它再生成一轮；这一轮生成
+        会被装饰阶段整个丢弃（内容已经发出去了）。用 AstrBot 自带的协作式
+        中止信号砍掉它，省掉几秒到十几秒空转，也避免会话被占着导致用户
+        连发的消息排队。
+        """
+        if not bool(self.config.get("stop_after_voice_tool", True)):
+            return
+        try:
+            event.set_extra(_HALTED_KEY, True)
+            event.set_extra(_STOP_KEY, True)
+        except Exception:
+            pass
 
     async def _register_audio_url(
         self, event: AstrMessageEvent, audio_path: str
@@ -526,28 +618,44 @@ class VoiceIntentPlugin(Star):
         event.set_extra(_TASK_KEY, task)
 
     async def _sync_voice_tool(self, event: AstrMessageEvent, req) -> None:
-        """按本轮判断结果决定 send_voice 工具是否出现在模型眼前。
+        """决定 send_voice 工具是否出现在模型眼前。
 
         工具是模型唯一真正会读的能力清单（tools 字段），比在几万字系统提示
         末尾加一段话可靠得多。判为文字时把工具摘掉，避免模型见谁都念。
-        结论缓存在事件上，工具循环的后续请求沿用，不会重复判断。
+
+        并行判断模式下，看着像要语音的消息不再先等判断结果，而是直接把工具
+        给模型、判断同时后台跑，等工具真被执行时再裁决，省掉判断那 2~5 秒。
         """
         mode = event.get_extra(_VOICE_MODE_KEY)
+        parallel = bool(self.config.get("parallel_judge", True))
+
+        if event.get_extra(_VOICE_SENT_KEY):
+            # 已经直接回过了（语音或文字）：摘工具，并催框架就地收尾
+            self._drop_voice_tool(req)
+            self._halt_agent(event)
+            return
 
         if mode is None:
             text = (event.message_str or "").strip()
             if _VOICE_HINT_RE.search(text):
-                # 看着像要语音：值得先等判断结果，再决定工具可见性
                 task = asyncio.create_task(self._judge(event, req))
                 task.add_done_callback(lambda t: t.cancelled() or t.exception())
                 event.set_extra(_FLAG_KEY, True)
                 event.set_extra(_TASK_KEY, task)
-                mode = await self._await_judge(task)
-                event.set_extra(_VOICE_MODE_KEY, bool(mode))
-                logger.info(
-                    f"[voice_intent] 预判为{'语音' if mode else '文字'}，"
-                    f"send_voice 工具{'已提供' if mode else '已摘除'}"
-                )
+                if parallel:
+                    # 不等结论：先给工具，工具执行时再看判断结果
+                    mode = _MODE_PENDING
+                    event.set_extra(_VOICE_MODE_KEY, mode)
+                    logger.info(
+                        "[voice_intent] 疑似语音：send_voice 已提供，判断并行进行"
+                    )
+                else:
+                    mode = await self._await_judge(task)
+                    event.set_extra(_VOICE_MODE_KEY, bool(mode))
+                    logger.info(
+                        f"[voice_intent] 预判为{'语音' if mode else '文字'}，"
+                        f"send_voice 工具{'已提供' if mode else '已摘除'}"
+                    )
             else:
                 # 不像要语音：不阻塞主回复，判断结果只留给发送阶段兜底
                 self._start_background_judge(event, req)
@@ -555,11 +663,7 @@ class VoiceIntentPlugin(Star):
                 mode = False
 
         # 工具循环的第二步起 req 可能是新对象，这里每次都要重新对齐
-        if event.get_extra(_VOICE_SENT_KEY):
-            # 已经发过了，别再让模型看见工具，免得重复发
-            self._drop_voice_tool(req)
-            return
-        if mode:
+        if mode is True or mode == _MODE_PENDING:
             self._prepare_voice_context(req, inject_prompt=False)
             self._inject_user_turn_note(req, VOICE_TOOL_NOTE)
         else:
@@ -1018,6 +1122,7 @@ class VoiceIntentPlugin(Star):
         if bool(self.config.get("use_jev", True)) and self._jev_key():
             want = await self._judge_jev(user_text, req, started)
             if want is not None:
+                event.set_extra(_JUDGE_OK_KEY, True)
                 return want
 
         return await self._judge_llm(event, user_text, req, started)
@@ -1059,6 +1164,10 @@ class VoiceIntentPlugin(Star):
                 "[voice_intent] 判断模型没有返回正文，可能是 reasoning 吃掉了 token；"
                 "请在模型配置里设置 reasoning_effort=none"
             )
+        else:
+            # 只有真的拿到了模型输出才算结论；空回复、超时、异常都不能当「判为文字」，
+            # 否则并行模式下会把一条本该发的语音降级成文字
+            event.set_extra(_JUDGE_OK_KEY, True)
         if bool(self.config.get("debug", False)):
             cost = time.monotonic() - started
             logger.info(
@@ -1068,6 +1177,44 @@ class VoiceIntentPlugin(Star):
         return want
 
     # ---------------- 发送前：按判断结果转语音 ----------------
+
+    @_on_agent_done_decorator
+    async def _cleanup_aborted_tail(self, event, run_context=None, response=None):
+        """清掉主动中止时框架写进对话历史的两条骨架消息。
+
+        中止走的是 AstrBot 自带的 /stop 通道，框架会往上下文里补一对
+        "Stop output." / "Output stopped."。我们不是真的被用户打断，
+        留着这两条会污染后续对话，所以在保存历史前删掉。
+        """
+        if not event.get_extra(_HALTED_KEY):
+            return
+        event.set_extra(_HALTED_KEY, None)
+        messages = getattr(run_context, "messages", None)
+        if not messages:
+            return
+
+        def _text(msg) -> str:
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                return content.strip()
+            parts = []
+            for part in content or []:
+                text = getattr(part, "text", None)
+                if text:
+                    parts.append(str(text))
+            return "".join(parts).strip()
+
+        try:
+            while len(messages) >= 2:
+                if (
+                    _text(messages[-1]) == "Output stopped."
+                    and _text(messages[-2]) == "Stop output."
+                ):
+                    del messages[-2:]
+                else:
+                    break
+        except Exception:
+            logger.warning("[voice_intent] 清理中止痕迹失败")
 
     @filter.on_decorating_result()
     async def _on_decorating_result(self, event: AstrMessageEvent):
@@ -1085,12 +1232,12 @@ class VoiceIntentPlugin(Star):
         if not bool(self.config.get("enabled", True)):
             return
 
-        # 模型已经调过 send_voice：语音发出去了，这里只负责把重复的正文丢掉
+        # 模型已经调过 send_voice：答复发出去了，这里只负责把重复的正文丢掉
         if event.get_extra(_VOICE_SENT_KEY):
             event.set_extra(_VOICE_SENT_KEY, None)
             sent_result = event.get_result()
             if sent_result is not None and sent_result.chain:
-                logger.info("[voice_intent] 本轮已用 send_voice 发过语音，丢弃重复正文")
+                logger.info("[voice_intent] 本轮已直接答复，丢弃重复正文")
                 sent_result.chain = []
             return
 
@@ -1326,13 +1473,22 @@ class VoiceIntentPlugin(Star):
         use_tool = bool(self.config.get("use_voice_tool", True))
         tell = bool(self.config.get("tell_model_voice_auto", True))
         strip = bool(self.config.get("strip_voice_tool", True))
+        parallel = bool(self.config.get("parallel_judge", True))
+        stop_after = bool(self.config.get("stop_after_voice_tool", True))
         if use_tool:
-            model_side = "send_voice 工具（判为语音时提供给模型）"
+            model_side = (
+                "send_voice 工具（判断并行，执行时裁决）"
+                if parallel
+                else "send_voice 工具（判为语音时提供给模型）"
+            )
         else:
             model_side = "已告知语音自动" if tell else "未告知"
         lines.append(
             f"模型侧：{model_side}"
             f" / {'已禁止工具发语音' if strip else '未限制工具发语音'}"
+        )
+        lines.append(
+            f"收尾：{'发出后立即结束本轮' if stop_after else '等模型再生成一轮（内容丢弃）'}"
         )
 
         yield event.plain_result("\n".join(lines))
