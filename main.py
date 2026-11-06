@@ -131,12 +131,35 @@ VOICE_TOOL_NOTE = (
     "</voice_reply_notice>"
 )
 
+# 上一轮发过语音、这一轮按文字回时用。模型在上下文里见过 send_voice 的调用记录，
+# 本轮工具被摘掉就容易答「这轮没有相关工具」，这句只堵这一个表述。
+VOICE_TEXT_NOTE = (
+    "\n" + VOICE_USER_NOTE_MARK + "\n"
+    "（系统提示，用户看不到）本轮按文字回复即可。\n"
+    "不要提及工具、插件或语音能力的有无，也不要解释这一轮为什么没有语音。\n"
+    "</voice_reply_notice>"
+)
+
 # 预筛：像不像在要语音。命中才值得把工具先给模型（判断并行跑），
 # 不命中就照旧后台并发判断，不阻塞主回复。
 _VOICE_HINT_RE = re.compile(
     r"语音|声音|声线|嗓子|说句话|说一段|说一句|念给|念一遍|念一下|读给|读一遍"
     r"|唱|听听|开口|发条音|来一段|来句|用嘴"
 )
+
+# 省略式承接：本轮没说「语音」，但指的是上一轮的形态。
+# 「发语音」→「再来一次」「还要」「继续」都依赖上下文才成立，单看字面判不出来。
+_VOICE_REPEAT_RE = re.compile(
+    r"^(?:"
+    r"再来|再一[次遍回个段句条]|再发|再说一?[次遍句段]|再念|再唱|再读|重来|重发"
+    r"|还要|还想要|继续|接着来|接着|换一[个条段句种]|换换"
+    r"|不够|没听够|多来|多说说|说多点|快点说|你倒是说"
+    r")"
+)
+# 承接句本身很短，超过这个长度就当成新话题，不按上下文延续处理。
+_VOICE_REPEAT_MAX_CHARS = 20
+# 上一轮语音的有效期：超过这个时间就不再默认「接着上一轮的形态」。
+_VOICE_SESSION_TTL = 900.0
 
 # 执行层兜底：即使模型还是写了「发不出声音」，转语音前把这句摘掉，
 # 避免出现「语音里说自己发不了语音」这种自相矛盾。
@@ -318,6 +341,8 @@ class VoiceIntentPlugin(Star):
         self.config = config
         # 记录被本插件改过的 tts 配置对象，插件停用时还原 enable 原值
         self._patched: list[tuple[dict, bool]] = []
+        # 每个会话上一次语音回复的时间，用于识别「再来一次」这类省略式承接
+        self._last_voice_at: dict[str, float] = {}
         # ResultDecorateStage 模块里的 random 被临时替换，停用时恢复
         self._stage_module = None
         self._stage_random_original = None
@@ -489,6 +514,7 @@ class VoiceIntentPlugin(Star):
             return "语音发送失败，请改用普通文字回复。"
 
         event.set_extra(_VOICE_SENT_KEY, True)
+        self._mark_session_voice(event)
         logger.info(f"[voice_intent] send_voice 已发送语音（{len(content)} 字）")
         self._halt_agent(event)
         return (
@@ -545,6 +571,7 @@ class VoiceIntentPlugin(Star):
             return "本轮不需要语音，请直接用文字回复。"
 
         event.set_extra(_VOICE_SENT_KEY, True)
+        self._clear_session_voice(event)
         logger.info(f"[voice_intent] 判为文字，send_voice 内容已按文字发出（{len(text)} 字）")
         self._halt_agent(event)
         return "已按文字发送给用户。本轮不需要再输出正文。"
@@ -637,7 +664,19 @@ class VoiceIntentPlugin(Star):
 
         if mode is None:
             text = (event.message_str or "").strip()
-            if _VOICE_HINT_RE.search(text):
+            hinted = bool(_VOICE_HINT_RE.search(text))
+            # 上一轮是语音时的省略式承接：「再来一次」「还要」「继续」字面上
+            # 没有任何语音词，但指的显然是上一轮的形态。
+            followup = (not hinted) and self._session_was_voice(event) and (
+                self._is_voice_followup(text)
+            )
+            if followup:
+                # 上一轮就是语音，本轮又只是「再来一次 / 还要 / 继续」这种承接，
+                # 形态是确定的，不必再问判断模型，省一次请求也避免被误判成文字。
+                mode = True
+                event.set_extra(_VOICE_MODE_KEY, True)
+                logger.info("[voice_intent] 承接上一轮语音，直接按语音处理")
+            elif hinted:
                 task = asyncio.create_task(self._judge(event, req))
                 task.add_done_callback(lambda t: t.cancelled() or t.exception())
                 event.set_extra(_FLAG_KEY, True)
@@ -669,6 +708,10 @@ class VoiceIntentPlugin(Star):
         else:
             self._drop_voice_tool(req)
             self._prepare_voice_context(req, inject_prompt=False)
+            if self._session_was_voice(event):
+                # 上一轮发过语音，这一轮按文字回。模型在上下文里见过 send_voice
+                # 的调用记录，工具一消失就容易答「这轮没有相关工具」，堵掉这句。
+                self._inject_user_turn_note(req, VOICE_TEXT_NOTE)
 
     def _drop_voice_tool(self, req) -> None:
         """把 send_voice 从本次请求的工具集里摘掉（只影响这次请求）。"""
@@ -835,7 +878,7 @@ class VoiceIntentPlugin(Star):
             return True
 
     async def _session_tts_enabled(self, event: AstrMessageEvent) -> bool:
-        """会话级 TTS 关闭时不要向模型宣称语音可用，也不要浪费判断请求。"""
+        """会话级 TTS 关闭时不要向模型宣称语音可用，也不发起无意义的判断请求。"""
         if SessionServiceManager is None:
             return True
         try:
@@ -877,6 +920,47 @@ class VoiceIntentPlugin(Star):
         except Exception:
             return None
 
+    def _mark_session_voice(self, event: AstrMessageEvent) -> None:
+        """记住这个会话刚发过语音，供下一轮的省略式承接使用。"""
+        try:
+            umo = event.unified_msg_origin
+        except Exception:
+            return
+        if not umo:
+            return
+        now = time.monotonic()
+        # 顺手清掉过期项，避免长期运行后字典无限增长
+        for key, ts in list(self._last_voice_at.items()):
+            if now - ts > _VOICE_SESSION_TTL:
+                self._last_voice_at.pop(key, None)
+        self._last_voice_at[umo] = now
+
+    def _clear_session_voice(self, event: AstrMessageEvent) -> None:
+        """本轮结论是文字回复，清掉语音记忆，免得下一轮误按承接处理。"""
+        try:
+            umo = event.unified_msg_origin
+        except Exception:
+            return
+        if umo:
+            self._last_voice_at.pop(umo, None)
+
+    def _session_was_voice(self, event: AstrMessageEvent) -> bool:
+        try:
+            umo = event.unified_msg_origin
+        except Exception:
+            return False
+        ts = self._last_voice_at.get(umo) if umo else None
+        if ts is None:
+            return False
+        return time.monotonic() - ts <= _VOICE_SESSION_TTL
+
+    def _is_voice_followup(self, text: str) -> bool:
+        """上一轮是语音时，判断本轮是不是「就着语音形态」的短承接。"""
+        text = (text or "").strip()
+        if not text or len(text) > _VOICE_REPEAT_MAX_CHARS:
+            return False
+        return bool(_VOICE_REPEAT_RE.search(text))
+
     def _recent_dialog(self, req) -> list[str]:
         """把最近几条对话整理成「用户: xxx」这种行，供两种判断方式复用。"""
         if not bool(self.config.get("include_context", True)):
@@ -905,27 +989,37 @@ class VoiceIntentPlugin(Star):
             lines.append(f"{label}: {content[:300]}")
         return lines
 
-    def _build_judge_prompt(self, user_text: str, req) -> str:
+    def _build_judge_prompt(self, user_text: str, req, prev_voice: bool = False) -> str:
         parts: list[str] = []
         lines = self._recent_dialog(req)
         if lines:
             parts.append("最近对话：\n" + "\n".join(lines))
+        if prev_voice:
+            parts.append(
+                "上一轮助手是用语音回复的。"
+                "如果本轮是省略式承接（再来一次 / 还要 / 继续 / 不够 这类），"
+                "指的是继续用语音回复。"
+            )
         parts.append(f"本轮用户消息：{user_text[:800]}")
         parts.append("本轮用户消息是否要求对方用语音回复？只回答 YES 或 NO。")
         return "\n\n".join(parts)
 
-    def _build_jev_state(self, user_text: str, req) -> dict:
+    def _build_jev_state(self, user_text: str, req, prev_voice: bool = False) -> dict:
         """按官方建议用结构化 state，明确区分最近对话和本轮消息。"""
         state: dict = {"latest_user_message": user_text[:800]}
         lines = self._recent_dialog(req)
         if lines:
             state["recent_dialog"] = lines
+        if prev_voice:
+            state["previous_assistant_reply_was_voice"] = True
         return state
 
     def _jev_key(self) -> str:
         return str(self.config.get("jev_api_key") or "").strip()
 
-    async def _judge_jev(self, user_text: str, req, started: float) -> bool | None:
+    async def _judge_jev(
+        self, user_text: str, req, started: float, prev_voice: bool = False
+    ) -> bool | None:
         """用 TypeSafe 的 Jev 做结构化判断。
 
         Jev 不是聊天模型：它接收一个 state 和若干「问题」，返回选项、概率和置信度。
@@ -949,13 +1043,19 @@ class VoiceIntentPlugin(Star):
         timeout = float(self.config.get("judge_timeout", 8) or 8)
 
         payload: dict = {
-            "state": self._build_jev_state(user_text, req),
+            "state": self._build_jev_state(user_text, req, prev_voice),
             "questions": {
                 "reply_mode": {
                     "type": "choice",
                     "instructions": {
                         "question": "`latest_user_message` 是否在要求对方用语音的形式回复？",
-                        "focus": "只判断 `latest_user_message` 要不要听语音；`recent_dialog` 仅用于理解省略和指代，不判断情绪、语气、话题或内容好坏。",
+                        "focus": (
+                            "只判断 `latest_user_message` 要不要听语音；`recent_dialog` 仅用于理解省略和指代，"
+                            "不判断情绪、语气、话题或内容好坏。"
+                            "当 state 里 `previous_assistant_reply_was_voice` 为 true，"
+                            "而本轮是「再来一次 / 还要 / 继续 / 不够」这类省略式承接时，"
+                            "判 voice。"
+                        ),
                     },
                     "criteria": {
                         "voice": {
@@ -1119,16 +1219,22 @@ class VoiceIntentPlugin(Star):
             return False
 
         # 优先走 Jev；没配 key 或调用失败时自动回退到对话模型
+        prev_voice = self._session_was_voice(event)
         if bool(self.config.get("use_jev", True)) and self._jev_key():
-            want = await self._judge_jev(user_text, req, started)
+            want = await self._judge_jev(user_text, req, started, prev_voice)
             if want is not None:
                 event.set_extra(_JUDGE_OK_KEY, True)
                 return want
 
-        return await self._judge_llm(event, user_text, req, started)
+        return await self._judge_llm(event, user_text, req, started, prev_voice)
 
     async def _judge_llm(
-        self, event: AstrMessageEvent, user_text: str, req, started: float
+        self,
+        event: AstrMessageEvent,
+        user_text: str,
+        req,
+        started: float,
+        prev_voice: bool = False,
     ) -> bool:
         provider = self._resolve_provider(event.unified_msg_origin)
         if provider is None:
@@ -1137,7 +1243,7 @@ class VoiceIntentPlugin(Star):
         system_prompt = (
             str(self.config.get("intent_prompt") or "").strip() or DEFAULT_INTENT_PROMPT
         )
-        prompt = self._build_judge_prompt(user_text, req)
+        prompt = self._build_judge_prompt(user_text, req, prev_voice)
 
         timeout = float(self.config.get("judge_timeout", 8) or 8)
         try:
@@ -1406,6 +1512,7 @@ class VoiceIntentPlugin(Star):
 
         if converted:
             result.chain = new_chain
+            self._mark_session_voice(event)
             logger.info(f"[voice_intent] 已转为语音回复（{converted} 段）")
         else:
             logger.info("[voice_intent] 没有可转换的文本段，保持文字回复")
