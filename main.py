@@ -325,7 +325,7 @@ def _retry_delay(resp, attempt: int) -> float:
     PLUGIN_NAME,
     "irislilymoon",
     "按 AI 意图判断决定发语音还是发文字：自动关掉内置概率语音，想听声音才发语音",
-    "0.2.3",
+    "0.2.4",
 )
 class VoiceIntentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -610,11 +610,76 @@ class VoiceIntentPlugin(Star):
         消息时多个 event 会同时走到这里，所以默认把合成排成队：后到的等前一段
         做完，而不是并发打过去被拒。并发是否开启由 `parallel_tts` 控制。
         """
-        deadline = asyncio.get_running_loop().time() + timeout
         if bool(self.config.get("parallel_tts", False)):
-            return await self._synthesize_once(tts, text, deadline)
+            return await self._synthesize_chain(tts, text, timeout)
         async with _TTS_LOCK:
-            return await self._synthesize_once(tts, text, deadline)
+            return await self._synthesize_chain(tts, text, timeout)
+
+    async def _synthesize_chain(self, tts, text: str, timeout: float) -> str | None:
+        """主提供商失败后按配置顺序换下一个，每个提供商各自一份超时预算。"""
+        chain = self._tts_candidates(tts)
+        last_error: Exception | None = None
+        for index, provider in enumerate(chain):
+            deadline = asyncio.get_running_loop().time() + timeout
+            try:
+                return await self._synthesize_once(provider, text, deadline)
+            except asyncio.TimeoutError:
+                # 已经等满一个完整预算，再换一家只会让用户等更久
+                raise
+            except Exception as e:
+                last_error = e
+                if index + 1 < len(chain):
+                    logger.warning(
+                        f"[voice_intent] 语音提供商合成失败，回退到下一个：{e}"
+                    )
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        return None
+
+    def _tts_candidates(self, primary) -> list:
+        """主提供商 + 回退提供商，去重。
+
+        回退列表留空时按 Provider 里的顺序取其余全部 TTS 提供商，这样只开
+        开关就能用；填了列表就严格按列表顺序。
+        """
+        chain = [primary] if primary is not None else []
+        if not bool(self.config.get("tts_fallback_enable", True)):
+            return chain
+        configured = self.config.get("tts_fallback_provider_ids") or []
+        if isinstance(configured, str):
+            configured = [configured]
+        if configured:
+            for provider_id in configured:
+                candidate = self._tts_provider_by_id(str(provider_id))
+                if candidate is None or any(c is candidate for c in chain):
+                    continue
+                chain.append(candidate)
+            return chain
+
+        try:
+            providers = self.context.get_all_tts_providers() or []
+        except Exception:
+            providers = []
+        for candidate in providers:
+            if any(c is candidate for c in chain):
+                continue
+            chain.append(candidate)
+        return chain
+
+    def _tts_provider_by_id(self, provider_id: str):
+        if not provider_id:
+            return None
+        try:
+            providers = self.context.get_all_tts_providers() or []
+        except Exception:
+            return None
+        for candidate in providers:
+            cfg = getattr(candidate, "provider_config", None) or {}
+            if str(cfg.get("id") or "") == provider_id:
+                return candidate
+        return None
 
     async def _synthesize_once(self, tts, text: str, deadline: float) -> str | None:
         """单段合成，429 时退避重试一次；仍然失败就抛给调用方转文字。"""
@@ -757,11 +822,14 @@ class VoiceIntentPlugin(Star):
             self._prepare_voice_context(req)
             self._inject_user_turn_note(req, VOICE_TOOL_NOTE)
         else:
-            self._drop_voice_tool(req)
+            # 判为文字时也不摘工具：模型能从上文里看到上一轮调用过 send_voice，
+            # 照着再调一次，摘掉只会换来框架一句「未找到指定的工具」，什么都没发
+            # 出去。工具留着，真伪交给执行层的 _resolve_tool_voice_mode 裁决：
+            # 判断结论是文字就按文字发，没结论就按语音发。
             self._prepare_voice_context(req)
             if self._session_was_voice(event):
                 # 上一轮发过语音，这一轮按文字回。模型在上下文里见过 send_voice
-                # 的调用记录，工具一消失就容易答「这轮没有相关工具」，堵掉这句。
+                # 的调用记录，堵掉「这轮没有相关工具」这类表述。
                 self._inject_user_turn_note(req, VOICE_TEXT_NOTE)
 
     def _drop_voice_tool(self, req) -> None:
@@ -1636,6 +1704,10 @@ class VoiceIntentPlugin(Star):
         lines.append("收尾：发出语音后立即结束本轮")
         serial = not bool(self.config.get("parallel_tts", False))
         lines.append(f"合成并发：{'关（排队串行）' if serial else '开（多段同时合成）'}")
+        fallback = bool(self.config.get("tts_fallback_enable", True))
+        lines.append(
+            f"语音回退：{'开（失败换下一个提供商）' if fallback else '关（失败直接发文字）'}"
+        )
 
         yield event.plain_result("\n".join(lines))
 
