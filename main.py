@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import math
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -33,6 +34,17 @@ try:
     from astrbot.api.provider import ProviderRequest
 except Exception:  # 兼容旧版本
     ProviderRequest = None  # type: ignore
+
+# 把说明塞进「本轮用户消息」需要 TextPart；不同版本位置不同，逐个试
+TextPart = None  # type: ignore
+for _mod_name in ("astrbot.core.agent.message", "astrbot.api.provider"):
+    try:
+        _mod = __import__(_mod_name, fromlist=["TextPart"])
+        TextPart = getattr(_mod, "TextPart", None)  # type: ignore
+    except Exception:
+        TextPart = None  # type: ignore
+    if TextPart is not None:
+        break
 
 try:
     from astrbot.core.star.session_llm_manager import SessionServiceManager
@@ -65,6 +77,31 @@ VOICE_AUTO_PROMPT = """
 - 不要说「我发不了语音」「没有 TTS 接口」「缺少音色」「沙箱未启用」这类话；
   你并不掌握语音通道的状态，这类判断一律是错误的。
 </voice_reply>"""
+
+# 只放在系统提示末尾不够：系统提示前面常挂着几万字的人格 / 框架设定，
+# 模型会照人格演一个「用手机打字的人」，照样回「我发不出声音」。
+# 因此再往「本轮用户消息」里贴一段，位置最靠近用户诉求，权重最高。
+VOICE_USER_NOTE_MARK = "<voice_reply_notice>"
+VOICE_USER_NOTE = (
+    "\n" + VOICE_USER_NOTE_MARK + "\n"
+    "（系统提示，用户看不到，不要复述本段）\n"
+    "本轮回复会由系统在发送阶段自动合成为语音，你只负责把话写出来。\n"
+    "禁止说「发不出声音 / 发不了语音 / 没法发语音 / 只能打字」这类话，"
+    "也不要说自己没有语音功能——语音通道不在你的判断范围内，"
+    "说这些话就是错的。\n"
+    "</voice_reply_notice>"
+)
+
+# 执行层兜底：即使模型还是写了「发不出声音」，转语音前把这句摘掉，
+# 避免出现「语音里说自己发不了语音」这种自相矛盾。
+_REFUSAL_VERBS = (
+    r"(?:发不出|发不了|没法发|不能发|无法发|不会发|给不了|没法用|用不了"
+    r"|没有(?:语音|发声|音频)(?:功能|能力|通道|接口)"
+    r"|(?:语音|发声|音频)(?:功能|能力|通道|接口)?(?:没有|未开启|不可用))"
+)
+_VOICE_NOUNS = r"(?:语音|声音|音频|嗓子|声线)"
+_REFUSAL_HINT_RE = re.compile(r"只能(?:打字|文字)|打不了语音|不能说话")
+_REFUSAL_SENTENCE_RE = re.compile(r"[^。！？!?\n]+[。！？!?]?")
 
 DEFAULT_INTENT_PROMPT = """你是一个意图分类器，只判断一件事：用户最新一条消息，是否在要求对方用「语音 / 声音」的形式回复。
 
@@ -390,12 +427,56 @@ class VoiceIntentPlugin(Star):
                 req.system_prompt = f"{getattr(req, 'system_prompt', '') or ''}{VOICE_AUTO_PROMPT}"
             except Exception:
                 logger.warning("[voice_intent] 追加语音说明失败")
+            if bool(self.config.get("voice_note_in_user_turn", True)):
+                self._inject_user_turn_note(req)
 
         if bool(self.config.get("strip_voice_tool", True)):
             try:
                 self._strip_voice_component(req)
             except Exception:
                 logger.error("[voice_intent] 屏蔽语音工具失败：\n" + traceback.format_exc())
+
+    def _inject_user_turn_note(self, req) -> None:
+        """把语音说明贴到本轮用户消息里，绕开「人格 / 框架提示太长冲淡」的问题。"""
+        if TextPart is None:
+            return
+        parts = getattr(req, "extra_user_content_parts", None)
+        if parts is None:
+            return
+        try:
+            for part in parts:
+                if VOICE_USER_NOTE_MARK in str(getattr(part, "text", "") or ""):
+                    return
+        except Exception:
+            return
+        try:
+            parts.append(TextPart(text=VOICE_USER_NOTE))
+        except Exception:
+            logger.warning("[voice_intent] 向用户消息追加语音说明失败")
+
+    def _scrub_voice_refusal(self, text: str) -> str:
+        """把「我发不出声音」这类自我否定句摘掉，其余原样保留。"""
+        sentences = _REFUSAL_SENTENCE_RE.findall(text or "")
+        if not sentences:
+            return text
+        kept: list[str] = []
+        dropped = 0
+        for sentence in sentences:
+            hit = bool(
+                re.search(_REFUSAL_VERBS, sentence)
+                and re.search(_VOICE_NOUNS, sentence)
+            ) or bool(_REFUSAL_HINT_RE.search(sentence))
+            if hit:
+                dropped += 1
+                continue
+            kept.append(sentence)
+        if not dropped:
+            return text
+        cleaned = "".join(kept).strip()
+        if not cleaned:
+            cleaned = "嗯，这就说给你听。"
+        logger.info(f"[voice_intent] 已摘掉 {dropped} 句「发不出声音」式自我否定")
+        return cleaned
 
     def _strip_voice_component(self, req) -> None:
         """把 send_message_to_user 的 record 能力摘掉，其余类型保持原样。"""
@@ -959,9 +1040,15 @@ class VoiceIntentPlugin(Star):
 
         new_chain: list = []
         converted = 0
+        scrub = bool(self.config.get("scrub_voice_refusal", True))
         for comp in result.chain:
             if isinstance(comp, Comp.Plain) and len(str(comp.text or "")) > 1:
                 text = str(comp.text)
+                if scrub:
+                    try:
+                        text = self._scrub_voice_refusal(text)
+                    except Exception:
+                        text = str(comp.text)
                 try:
                     audio_path = await tts.get_audio(text)
                 except Exception as e:
