@@ -138,7 +138,7 @@ _VOICE_HINT_RE = re.compile(
 _VOICE_REPEAT_RE = re.compile(
     r"^(?:"
     r"再来|再一[次遍回个段句条]|再发|再说一?[次遍句段]|再念|再唱|再读|重来|重发"
-    r"|还要|还想要|继续|接着来|接着|换一[个条段句种]|换换"
+    r"|再试|不行就再|还要|还想要|继续|接着来|接着|换一[个条段句种]|换换"
     r"|不够|没听够|多来|多说说|说多点|快点说|你倒是说"
     r")"
 )
@@ -325,7 +325,7 @@ def _retry_delay(resp, attempt: int) -> float:
     PLUGIN_NAME,
     "irislilymoon",
     "按 AI 意图判断决定发语音还是发文字：自动关掉内置概率语音，想听声音才发语音",
-    "0.2.4",
+    "0.2.5",
 )
 class VoiceIntentPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -616,27 +616,43 @@ class VoiceIntentPlugin(Star):
             return await self._synthesize_chain(tts, text, timeout)
 
     async def _synthesize_chain(self, tts, text: str, timeout: float) -> str | None:
-        """主提供商失败后按配置顺序换下一个，每个提供商各自一份超时预算。"""
+        """按顺序尝试各提供商，`timeout` 是整轮总预算而不是每家的预算。
+
+        单家最多用掉总预算的 55%，剩下的留给回退：一家挂住不能把整轮的时间
+        全吃掉，否则和「不回退」没有区别。超时同样换下一家，这是最常见的
+        失败形态——服务端不报错，就是不返回。
+        """
         chain = self._tts_candidates(tts)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        per_try = max(15.0, timeout * 0.55)
         last_error: Exception | None = None
+
         for index, provider in enumerate(chain):
-            deadline = asyncio.get_running_loop().time() + timeout
+            remaining = deadline - loop.time()
+            if remaining <= 0.5:
+                break
+            is_last = index + 1 >= len(chain)
+            # 非最后一家最多用掉剩余预算的 60%，保证后面还有时间换人；
+            # 单家上限是总预算的 55%，免得第一家的慢把整轮吃掉。
+            budget = remaining if is_last else min(remaining * 0.6, per_try)
             try:
-                return await self._synthesize_once(provider, text, deadline)
-            except asyncio.TimeoutError:
-                # 已经等满一个完整预算，再换一家只会让用户等更久
-                raise
+                return await self._synthesize_once(
+                    provider, text, loop.time() + budget
+                )
             except Exception as e:
                 last_error = e
-                if index + 1 < len(chain):
-                    logger.warning(
-                        f"[voice_intent] 语音提供商合成失败，回退到下一个：{e}"
-                    )
-                    continue
-                raise
+                if is_last:
+                    raise
+                reason = str(e) or type(e).__name__
+                logger.warning(
+                    f"[voice_intent] 语音合成失败（{reason}），回退到下一个提供商"
+                )
+                continue
+
         if last_error is not None:
             raise last_error
-        return None
+        raise asyncio.TimeoutError
 
     def _tts_candidates(self, primary) -> list:
         """主提供商 + 回退提供商，去重。
@@ -662,10 +678,16 @@ class VoiceIntentPlugin(Star):
             providers = self.context.get_all_tts_providers() or []
         except Exception:
             providers = []
-        for candidate in providers:
-            if any(c is candidate for c in chain):
-                continue
-            chain.append(candidate)
+
+        def account(item) -> str:
+            cfg = getattr(item, "provider_config", None) or {}
+            return str(cfg.get("provider") or "")
+
+        primary_account = account(primary) if primary is not None else ""
+        others = [c for c in providers if not any(c is item for item in chain)]
+        # 同一个账号的提供商（比如两个 mimo 音色）会一起限流、一起挂住，排到后面
+        others.sort(key=lambda c: 1 if account(c) == primary_account else 0)
+        chain.extend(others)
         return chain
 
     def _tts_provider_by_id(self, provider_id: str):
@@ -783,9 +805,9 @@ class VoiceIntentPlugin(Star):
             hinted = bool(_VOICE_HINT_RE.search(text))
             # 上一轮是语音时的省略式承接：「再来一次」「还要」「继续」字面上
             # 没有任何语音词，但指的显然是上一轮的形态。
-            followup = (not hinted) and self._session_was_voice(event) and (
-                self._is_voice_followup(text)
-            )
+            followup = (not hinted) and (
+                self._session_was_voice(event) or self._context_has_voice_call(req)
+            ) and (self._is_voice_followup(text))
             if followup:
                 # 上一轮就是语音，本轮又只是「再来一次 / 还要 / 继续」这种承接，
                 # 形态是确定的，不必再问判断模型，省一次请求也避免被误判成文字。
@@ -1060,6 +1082,21 @@ class VoiceIntentPlugin(Star):
         if ts is None:
             return False
         return time.monotonic() - ts <= _VOICE_SESSION_TTL
+
+    def _context_has_voice_call(self, req) -> bool:
+        """上下文里最近几轮是否调用过 send_voice。
+
+        语音记忆存在内存里，重启就没了；但对话历史还在，模型自己看得到上一轮
+        调用过 send_voice。重启后第一句「再来一次」靠这个兜住。
+        """
+        contexts = getattr(req, "contexts", None) or []
+        for item in contexts[-8:]:
+            try:
+                if _VOICE_TOOL_NAME in str(item):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _is_voice_followup(self, text: str) -> bool:
         """上一轮是语音时，判断本轮是不是「就着语音形态」的短承接。"""
